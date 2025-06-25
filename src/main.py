@@ -288,6 +288,12 @@ class ReservationsTab(QWidget):
         self.date_edit.setDate(date.today())
         self.start_time = QTimeEdit()
         self.end_time = QTimeEdit()
+        self.start_time.setTime(QTime(8, 0))
+        self.end_time.setTime(QTime(9, 0))
+        self.start_time.setMinimumTime(QTime(8, 0))
+        self.start_time.setMaximumTime(QTime(21, 0))
+        self.end_time.setMinimumTime(QTime(8, 0))
+        self.end_time.setMaximumTime(QTime(22, 0))
 
         form_layout.addRow("Имя клиента:", self.name_input)
         form_layout.addRow("Телефон клиента:", self.phone_input)
@@ -402,6 +408,13 @@ class ReservationsTab(QWidget):
         end_dt = datetime.combine(res_date, end)
         if (end_dt - start_dt).total_seconds() < 3600:
             QMessageBox.warning(self, "Ошибка", "Минимальное время бронирования — 1 час")
+            return
+
+        # Проверка на рабочее время ресторана
+        open_time = time(8, 0)
+        close_time = time(22, 0)
+        if start < open_time or end > close_time:
+            QMessageBox.warning(self, "Ошибка", "Бронирование возможно только с 8:00 до 22:00")
             return
 
         # Преобразуем res_date в datetime
