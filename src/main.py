@@ -74,7 +74,7 @@ class LoginWindow(QWidget):
             QMessageBox.warning(self, "Ошибка", "Логин должен быть на латинице и не менее 4 символов")
             return
         if not re.fullmatch(r'[A-Za-z0-9]{4,}', password):
-            QMessageBox.warning(self, "Ошибка", "Пароль должен быть на латинице и не менее 4 символов")
+            QMessageBox.warning(self, "Ошибка", "Пароль должен быть на латинице и не менее 4 символа")
             return
 
         if waiter_collection.find_one({"login": login}):
@@ -103,14 +103,16 @@ class MainWindow(QMainWindow):
         self.tables_tab = TablesTab(is_admin=user.get("isAdmin", False))
         self.reservations_tab = ReservationsTab()
         self.orders_tab = OrdersTab(user)
-        self.receipts_tab = ReceiptsTab()
+        self.receipts_tab = ReceiptsTab(user)
         self.menu_tab = MenuTab(is_admin=user.get("isAdmin", False))  # Передаем флаг
+        self.stats_tab = StatsTab()  # Новая вкладка статистики
 
         self.tabs.addTab(self.tables_tab, "Столы")
         self.tabs.addTab(self.reservations_tab, "Бронирования")
         self.tabs.addTab(self.orders_tab, "Заказы")
         self.tabs.addTab(self.receipts_tab, "Счета")
         self.tabs.addTab(self.menu_tab, "Меню")  # Добавляем вкладку меню
+        self.tabs.addTab(self.stats_tab, "Статистика")  # Добавляем вкладку статистики
 
         # Обновление данных между вкладками (пример)
         self.reservations_tab.reservation_created.connect(self.tables_tab.load_tables)
@@ -378,11 +380,28 @@ class ReservationsTab(QWidget):
         start = self.start_time.time().toPython()
         end = self.end_time.time().toPython()
 
+        # Проверка на прошедшую дату
+        today = datetime.now().date()
+        if res_date < today:
+            QMessageBox.warning(self, "Ошибка", "Нельзя бронировать на прошедшую дату")
+            return
+        # Если дата сегодня, проверяем время
+        if res_date == today and start <= datetime.now().time():
+            QMessageBox.warning(self, "Ошибка", "Время бронирования должно быть позже текущего")
+            return
+
         if not name or not phone or not table_id:
             QMessageBox.warning(self, "Ошибка", "Заполните все поля")
             return
         if start >= end:
             QMessageBox.warning(self, "Ошибка", "Время начала должно быть меньше конца")
+            return
+
+        # Проверка минимального времени бронирования (1 час)
+        start_dt = datetime.combine(res_date, start)
+        end_dt = datetime.combine(res_date, end)
+        if (end_dt - start_dt).total_seconds() < 3600:
+            QMessageBox.warning(self, "Ошибка", "Минимальное время бронирования — 1 час")
             return
 
         # Преобразуем res_date в datetime
@@ -684,10 +703,11 @@ class OrdersTab(QWidget):
 
         # Создаем счет
         receipt_collection.insert_one({
-            "orderId": order["_id"],  # обязательно ObjectId, а не строка!
+            "orderId": order["_id"],
             "date": datetime.now(),
             "amount": amount,
-            "paid": False
+            "paid": False,
+            "waiterLogin": order.get("waiterLogin", "")  # Сохраняем официанта, создавшего заказ
         })
 
         QMessageBox.information(self, "Успешно", "Счет выдан")
@@ -822,18 +842,24 @@ class OrderDialog(QDialog):
 class ReceiptsTab(QWidget):
     receipt_paid = Signal()  # Новый сигнал
 
-    def __init__(self):
+    def __init__(self, user):
         super().__init__()
+        self.user = user
         layout = QVBoxLayout(self)
 
         self.receipts_table = QTableWidget()
-        self.receipts_table.setColumnCount(5)
-        self.receipts_table.setHorizontalHeaderLabels(["Клиент", "Дата", "Заказ", "Сумма", "Оплачен"])
+        self.receipts_table.setColumnCount(7)
+        self.receipts_table.setHorizontalHeaderLabels([
+            "Клиент", "Дата", "Заказ", "Сумма", "Оплачен", "Ответственный", "Кто закрыл"
+        ])
 
         btn_pay = QPushButton("Оплатить счет")
+        btn_create_total = QPushButton("Создать общий счет")
         layout.addWidget(self.receipts_table)
+        layout.addWidget(btn_create_total)
         layout.addWidget(btn_pay)
 
+        btn_create_total.clicked.connect(self.create_total_receipt)
         btn_pay.clicked.connect(self.pay_receipt)
 
         self.load_receipts()
@@ -857,6 +883,8 @@ class ReceiptsTab(QWidget):
             self.receipts_table.setItem(row, 2, QTableWidgetItem(str(order["_id"]) if order else ""))
             self.receipts_table.setItem(row, 3, QTableWidgetItem(str(receipt.get("amount", 0))))
             self.receipts_table.setItem(row, 4, QTableWidgetItem("Да" if receipt.get("paid", False) else "Нет"))
+            self.receipts_table.setItem(row, 5, QTableWidgetItem(receipt.get("waiterLogin", "")))
+            self.receipts_table.setItem(row, 6, QTableWidgetItem(receipt.get("closedBy", "") if receipt.get("paid") else ""))
 
             self.receipts_table.item(row, 0).setData(Qt.UserRole, receipt["_id"])
 
@@ -875,16 +903,77 @@ class ReceiptsTab(QWidget):
             QMessageBox.information(self, "Инфо", "Счет уже оплачен")
             return
 
-        # Формируем оплату
-        receipt_collection.update_one({"_id": receipt_id}, {"$set": {"paid": True, "paymentDate": datetime.now()}})
-        
-        # Меняем статус заказа на "paid"
-        if "orderId" in receipt:
+        closed_by = getattr(self, "user", {}).get("login", "Неизвестно")
+
+        receipt_collection.update_one(
+            {"_id": receipt_id},
+            {"$set": {"paid": True, "paymentDate": datetime.now(), "closedBy": closed_by}}
+        )
+
+        # Если это общий счет — оплачиваем все заказы
+        if "orderIds" in receipt:
+            order_collection.update_many(
+                {"_id": {"$in": receipt["orderIds"]}},
+                {"$set": {"status": "paid"}}
+            )
+        elif "orderId" in receipt:
             order_collection.update_one({"_id": receipt["orderId"]}, {"$set": {"status": "paid"}})
 
         QMessageBox.information(self, "Оплата", "Счет оплачен")
         self.load_receipts()
         self.receipt_paid.emit()  # Сигнал для обновления заказов
+
+        # --- Обновление статистики ---
+        main_window = self.window()
+        if hasattr(main_window, "stats_tab"):
+            main_window.stats_tab.load_stats()
+
+    def create_total_receipt(self):
+        # Получаем выбранного клиента
+        selected = self.receipts_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите счет клиента")
+            return
+        row = self.receipts_table.currentRow()
+        customer_name = self.receipts_table.item(row, 0).text()
+        customer = customer_collection.find_one({"name": customer_name})
+        if not customer:
+            QMessageBox.warning(self, "Ошибка", "Клиент не найден")
+            return
+
+        # Находим все неоплаченные заказы клиента
+        orders = list(order_collection.find({
+            "customerId": customer["_id"],
+            "status": {"$ne": "paid"}
+        }))
+        if not orders:
+            QMessageBox.information(self, "Инфо", "Нет неоплаченных заказов для этого клиента")
+            return
+
+        # Проверяем, нет ли уже общего счета на эти заказы
+        order_ids = [o["_id"] for o in orders]
+        existing = receipt_collection.find_one({"orderIds": {"$all": order_ids}})
+        if existing:
+            QMessageBox.information(self, "Инфо", "Общий счет уже создан")
+            return
+
+        # Считаем сумму по всем заказам
+        amount = 0
+        for order in orders:
+            amount += sum(item["price"] * item["quantity"] for item in order.get("dishes", []))
+
+        # Создаем общий счет
+        receipt_collection.insert_one({
+            "orderIds": order_ids,
+            "date": datetime.now(),
+            "amount": amount,
+            "paid": False,
+            "waiterLogin": orders[0].get("waiterLogin", "") if orders else "",
+            "customerId": customer["_id"]
+        })
+
+        QMessageBox.information(self, "Успешно", "Общий счет создан")
+        self.load_receipts()
 
 
 # --- Вкладка меню ---
@@ -1049,6 +1138,39 @@ class MenuTab(QWidget):
         if reply == QMessageBox.Yes:
             menu_collection.delete_one({"_id": item_id})
             self.load_menu()
+
+# --- Вкладка статистики ---
+class StatsTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+
+        self.stats_table = QTableWidget()
+        self.stats_table.setColumnCount(2)
+        self.stats_table.setHorizontalHeaderLabels(["Официант", "Закрыто счетов"])
+
+        layout.addWidget(self.stats_table)
+        self.setLayout(layout)
+        self.load_stats()
+
+    def load_stats(self):
+        self.stats_table.setRowCount(0)
+        # Считаем количество закрытых счетов по каждому официанту
+        pipeline = [
+            {"$match": {"paid": True, "closedBy": {"$ne": None}}},
+            {"$group": {"_id": "$closedBy", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        stats = list(receipt_collection.aggregate(pipeline))
+        for stat in stats:
+            row = self.stats_table.rowCount()
+            self.stats_table.insertRow(row)
+            self.stats_table.setItem(row, 0, QTableWidgetItem(str(stat["_id"])))
+            self.stats_table.setItem(row, 1, QTableWidgetItem(str(stat["count"])))
+
+        if hasattr(self.parent(), "stats_tab"):
+            self.parent().stats_tab.load_stats()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
