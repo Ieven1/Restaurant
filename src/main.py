@@ -382,7 +382,7 @@ class ReservationsTab(QWidget):
         name = self.name_input.text().strip()
         phone = self.phone_input.text().strip()
         table_id = self.table_combo.currentData()
-        res_date = self.date_edit.date().toPython()
+        res_date = self.date_edit.date().toPython()  # <-- date_edit определён выше в этой же функции
         start = self.start_time.time().toPython()
         end = self.end_time.time().toPython()
 
@@ -608,13 +608,17 @@ class OrdersTab(QWidget):
             "Клиент", "Стол", "Дата", "Блюда", "Статус", "Ответственный"
         ])
 
+        layout.addWidget(self.orders_table)
+
+        btn_edit_order = QPushButton("Редактировать заказ")
+        layout.addWidget(btn_edit_order)
+        btn_edit_order.clicked.connect(self.edit_order)
+
         # Кнопки для создания заказа, изменения статуса, выдачи счета и удаления заказа
         btn_new_order = QPushButton("Создать заказ")
         btn_change_status = QPushButton("Изменить статус заказа")
         btn_create_receipt = QPushButton("Выдать счет")
         btn_delete_order = QPushButton("Удалить заказ")  # Новая кнопка
-
-        layout.addWidget(self.orders_table)
         layout.addWidget(btn_new_order)
         layout.addWidget(btn_change_status)
         layout.addWidget(btn_create_receipt)
@@ -727,6 +731,154 @@ class OrdersTab(QWidget):
         self.receipt_created.emit()  # Сигнал о создании счета
 
 
+    def edit_order(self):
+        selected = self.orders_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите заказ")
+            return
+        row = self.orders_table.currentRow()
+        order_id = self.orders_table.item(row, 0).data(Qt.UserRole)
+        order = order_collection.find_one({"_id": order_id})
+        if not order:
+            QMessageBox.warning(self, "Ошибка", "Заказ не найден")
+            return
+
+        # Проверка статуса и счета
+        if order.get("status") in ["cancelled", "paid"]:
+            QMessageBox.warning(self, "Ошибка", "Нельзя редактировать отменённый или оплаченный заказ")
+            return
+        receipt = receipt_collection.find_one({"orderId": order_id})
+        if receipt:
+            QMessageBox.warning(self, "Ошибка", "Нельзя редактировать заказ, по которому уже выдан счет")
+            return
+
+        # Получаем данные для редактирования
+        customer = customer_collection.find_one({"_id": order.get("customerId")})
+        table = table_collection.find_one({"_id": order.get("tableId")})
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Редактировать заказ")
+        layout = QFormLayout(dialog)
+
+        name_edit = QLineEdit(customer.get("name", "") if customer else "")
+        phone_edit = QLineEdit(customer.get("phone", "") if customer else "")
+
+        table_combo = QComboBox()
+        for t in table_collection.find({"isAvailable": True}):
+            table_combo.addItem(f"Стол {t['tableNumber']} (мест: {t['seats']})", t["_id"])
+            if table and t["_id"] == table["_id"]:
+                table_combo.setCurrentIndex(table_combo.count() - 1)
+
+        # Список блюд
+        menu_items = list(menu_collection.find())
+        dishes_list = QListWidget()
+        for item in menu_items:
+            lw_item = QListWidgetItem(f"{item['name']} - {item['price']} руб.")
+            lw_item.setData(Qt.UserRole, item)
+            dishes_list.addItem(lw_item)
+
+        # Отметим уже выбранные блюда
+        selected_dishes = []
+        for d in order.get("dishes", []):
+            for item in menu_items:
+                if item["name"] == d["name"]:
+                    selected_dishes.append({"item": item, "quantity": d["quantity"]})
+
+        order_dishes_list = QListWidget()
+        for d in selected_dishes:
+            order_dishes_list.addItem(f"{d['item']['name']} x{d['quantity']}")
+
+        def add_dish():
+            selected = dishes_list.currentItem()
+            if not selected:
+                return
+            item = selected.data(Qt.UserRole)
+            quantity, ok = QInputDialog.getInt(dialog, "Количество", f"Сколько {item['name']} добавить?", 1, 1)
+            if ok:
+                found = False
+                for d in selected_dishes:
+                    if d["item"]["_id"] == item["_id"]:
+                        d["quantity"] += quantity
+                        found = True
+                        break
+                if not found:
+                    selected_dishes.append({"item": item, "quantity": quantity})
+                refresh_order_dishes()
+
+        def remove_dish():
+            selected_items = order_dishes_list.selectedItems()
+            if not selected_items:
+                return
+            for item in selected_items:
+                text = item.text()
+                name = text.split(" x")[0]
+                # Удаляем из локального списка selected_dishes
+                selected_dishes[:] = [d for d in selected_dishes if d['item']['name'] != name]
+            refresh_order_dishes()
+
+        def refresh_order_dishes():
+            order_dishes_list.clear()
+            for d in selected_dishes:
+                order_dishes_list.addItem(f"{d['item']['name']} x{d['quantity']}")
+
+        btn_add_dish = QPushButton("Добавить блюдо")
+        btn_add_dish.clicked.connect(add_dish)
+
+        btn_remove_dish = QPushButton("Удалить выбранное блюдо")
+        btn_remove_dish.clicked.connect(remove_dish)
+
+        layout.addRow("Имя клиента:", name_edit)
+        layout.addRow("Телефон клиента:", phone_edit)
+        layout.addRow("Стол:", table_combo)
+        layout.addRow("Меню:", dishes_list)
+        layout.addRow(btn_add_dish)
+        layout.addRow(btn_remove_dish)
+        layout.addRow("Выбранные блюда:", order_dishes_list)
+
+        btn_ok = QPushButton("Сохранить")
+        btn_cancel = QPushButton("Отмена")
+        btn_box = QHBoxLayout()
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        layout.addRow(btn_box)
+
+        def on_ok():
+            name = name_edit.text().strip()
+            phone = phone_edit.text().strip()
+            table_id = table_combo.currentData()
+
+            if not name or not phone or not table_id:
+                QMessageBox.warning(dialog, "Ошибка", "Заполните все поля")
+                return
+            if not selected_dishes:
+                QMessageBox.warning(dialog, "Ошибка", "Добавьте хотя бы одно блюдо")
+                return
+
+            # Обновляем/создаем клиента
+            customer = customer_collection.find_one({"phone": phone})
+            if not customer:
+                customer_id = customer_collection.insert_one({"name": name, "phone": phone}).inserted_id
+            else:
+                customer_id = customer["_id"]
+
+            order_collection.update_one(
+                {"_id": order_id},
+                {"$set": {
+                    "customerId": customer_id,
+                    "tableId": table_id,
+                    "dishes": [{"name": d["item"]["name"], "price": d["item"]["price"], "quantity": d["quantity"]} for d in selected_dishes]
+                }}
+            )
+            QMessageBox.information(dialog, "Успешно", "Заказ обновлен")
+            self.load_orders()
+            self.order_updated.emit()
+            dialog.accept()
+
+        btn_ok.clicked.connect(on_ok)
+        btn_cancel.clicked.connect(dialog.reject)
+        dialog.exec()
+
+
 class OrderDialog(QDialog):
     def __init__(self, user):
         super().__init__()
@@ -749,6 +901,10 @@ class OrderDialog(QDialog):
         btn_add_dish = QPushButton("Добавить в заказ")
         btn_add_dish.clicked.connect(self.add_dish_to_order)
 
+        # --- Кнопка удалить выбранное блюдо ---
+        btn_remove_dish = QPushButton("Удалить выбранное блюдо")
+        btn_remove_dish.clicked.connect(self.remove_dish_from_order)
+
         btn_submit = QPushButton("Создать заказ")
         btn_submit.clicked.connect(self.submit_order)
 
@@ -761,6 +917,7 @@ class OrderDialog(QDialog):
         layout.addWidget(QLabel("Меню:"))
         layout.addWidget(self.menu_list)
         layout.addWidget(btn_add_dish)
+        layout.addWidget(btn_remove_dish)  # Добавляем кнопку удаления
 
         self.order_dishes_list = QListWidget()
         layout.addWidget(QLabel("Выбранные блюда:"))
@@ -814,6 +971,16 @@ class OrderDialog(QDialog):
             if not found:
                 self.selected_dishes.append({"item": item, "quantity": quantity})
             self.refresh_order_dishes()
+
+    def remove_dish_from_order(self):
+        selected_items = self.order_dishes_list.selectedItems()
+        if not selected_items:
+            return
+        for item in selected_items:
+            text = item.text()
+            name = text.split(" x")[0]
+            self.selected_dishes[:] = [d for d in self.selected_dishes if d['item']['name'] != name]
+        self.refresh_order_dishes()
 
     def refresh_order_dishes(self):
         self.order_dishes_list.clear()
